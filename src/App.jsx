@@ -8,13 +8,13 @@ const MarathonTracker = () => {
   const [weatherLoading, setWeatherLoading] = useState(false);
   const [stravaActivities, setStravaActivities] = useState({});
   const [stravaAccessToken, setStravaAccessToken] = useState('');
+  const [stravaRefreshToken, setStravaRefreshToken] = useState('');
+  const [stravaTokenExpiry, setStravaTokenExpiry] = useState(null);
   const [stravaConnected, setStravaConnected] = useState(false);
   const [suggestedActivities, setSuggestedActivities] = useState({});
   const [touchStartX, setTouchStartX] = useState(null);
   const [touchEndX, setTouchEndX] = useState(null);
-  const [stravaJustConnected, setStravaJustConnected] = useState(false);
   const [speedUnit, setSpeedUnit] = useState('pace');
-
 
   const trainingPlan = {
   "goal": "3:21",
@@ -227,8 +227,7 @@ const MarathonTracker = () => {
       ]
     }
   ]
-}
-;
+};
 
   // --- SWIPE NAVIGATION HANDLERS ---
   const minSwipeDistance = 50; 
@@ -249,6 +248,50 @@ const MarathonTracker = () => {
       }
   };
 
+  const refreshStravaToken = async (refreshToken) => {
+    const clientId = localStorage.getItem('strava-client-id');
+    const clientSecret = import.meta.env.VITE_STRAVA_CLIENT_SECRET;
+  
+    if (!clientId || !clientSecret) {
+      setStravaConnected(false);
+      return;
+    }
+    try {
+      const response = await fetch('https://www.strava.com/oauth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: clientId,
+          client_secret: clientSecret,
+          refresh_token: refreshToken,
+          grant_type: 'refresh_token'
+        })
+      });
+  
+      const data = await response.json();
+  
+      if (data.access_token) {
+        setStravaAccessToken(data.access_token);
+        setStravaRefreshToken(data.refresh_token);
+        setStravaTokenExpiry(data.expires_at);
+        setStravaConnected(true);
+  
+        localStorage.setItem('strava-access-token', data.access_token);
+        localStorage.setItem('strava-refresh-token', data.refresh_token);
+        localStorage.setItem('strava-token-expiry', data.expires_at.toString());
+      } else {
+        throw new Error('Failed to refresh token');
+      }
+    } catch (error) {
+      console.error('Token refresh failed:', error);
+      // Clear invalid tokens
+      localStorage.removeItem('strava-access-token');
+      localStorage.removeItem('strava-refresh-token');
+      localStorage.removeItem('strava-token-expiry');
+      setStravaConnected(false);
+    }
+  };
+
 
  useEffect(() => {
     const saved = localStorage.getItem('marathon-completed-sessions');
@@ -262,14 +305,24 @@ const MarathonTracker = () => {
     }
 
     const tokenFromStorage = localStorage.getItem('strava-access-token');
-    const tokenFromEnv = import.meta.env.VITE_STRAVA_ACCESS_TOKEN;
-    const existingToken = tokenFromStorage || tokenFromEnv;
+    const refreshToken = localStorage.getItem('strava-refresh-token');
+    const expiryTime = localStorage.getItem('strava-token-expiry');
 
-    if (existingToken) {
-      setStravaAccessToken(existingToken);
-      setStravaConnected(true);
+    if (tokenFromStorage && refreshToken && expiryTime) {
+      const now = Math.floor(Date.now() / 1000);
+      const expiry = parseInt(expiryTime);
+
+      if (now < expiry) {
+        // Token is still valid
+        setStravaAccessToken(tokenFromStorage);
+        setStravaRefreshToken(refreshToken);
+        setStravaTokenExpiry(expiry);
+        setStravaConnected(true);
+      } else {
+        // Token expired, try to refresh
+        refreshStravaToken(refreshToken);
+      }
     }
-
   }, []);
 
   useEffect(() => {
@@ -280,6 +333,10 @@ const MarathonTracker = () => {
     if (week) {
       setCurrentWeek(week.week);
       fetchWeatherForWeek(week);
+    } else {
+      // If no current week is found (e.g., plan is in the future), default to week 1
+      setCurrentWeek(1);
+      fetchWeatherForWeek(trainingPlan.weeks[0]);
     }
   }, []);
 
@@ -373,7 +430,10 @@ const toggleSession = (sessionId) => {
 
   const connectStrava = () => {
     const clientId = import.meta.env.VITE_STRAVA_CLIENT_ID;
-    if (!clientId) return;
+    if (!clientId || clientId === 'YOUR_CLIENT_ID') {
+        alert('Please configure your Strava Client ID at the top of the component file.');
+        return;
+    };
     localStorage.setItem('strava-client-id', clientId);
     const redirectUri = window.location.origin;
     const scope = 'read,activity:read';
@@ -387,7 +447,7 @@ const toggleSession = (sessionId) => {
     const clientId = localStorage.getItem('strava-client-id');
     const clientSecret = import.meta.env.VITE_STRAVA_CLIENT_SECRET; 
     if (code && clientId) {
-      if (!clientSecret) return;
+      if (!clientSecret || clientSecret === 'YOUR_CLIENT_SECRET') return;
       try {
         const response = await fetch('https://www.strava.com/oauth/token', {
           method: 'POST',
@@ -402,11 +462,15 @@ const toggleSession = (sessionId) => {
         const data = await response.json();
         if (data.access_token) {
           setStravaAccessToken(data.access_token);
+          setStravaRefreshToken(data.refresh_token);
+          setStravaTokenExpiry(data.expires_at);
           setStravaConnected(true);
+    
           localStorage.setItem('strava-access-token', data.access_token);
+          localStorage.setItem('strava-refresh-token', data.refresh_token);
+          localStorage.setItem('strava-token-expiry', data.expires_at.toString());
+    
           window.history.replaceState({}, document.title, window.location.pathname);
-          setStravaJustConnected(true);
-          setTimeout(() => setStravaJustConnected(false), 3000); 
         }
       } catch (error) {
         console.error('Strava auth error:', error);
@@ -419,11 +483,18 @@ const toggleSession = (sessionId) => {
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get('code') && !stravaConnected) {
       handleStravaCallback();
-    }
+    }else if(!stravaConnected)connectStrava();
   }, []);
 
   const fetchStravaActivitiesForDate = async (date) => {
     if (!stravaAccessToken) return [];
+  
+    // Check if token is about to expire (within 5 minutes)
+    const now = Math.floor(Date.now() / 1000);
+    if (stravaTokenExpiry && now > stravaTokenExpiry - 300) {
+      await refreshStravaToken(stravaRefreshToken);
+    }
+  
     try {
       const startOfDay = new Date(date + 'T00:00:00').getTime() / 1000;
       const endOfDay = new Date(date + 'T23:59:59').getTime() / 1000;
@@ -431,6 +502,13 @@ const toggleSession = (sessionId) => {
         `https://www.strava.com/api/v3/athlete/activities?after=${startOfDay}&before=${endOfDay}&per_page=10`,
         { headers: { 'Authorization': `Bearer ${stravaAccessToken}` } }
       );
+  
+      if (response.status === 401) {
+        // Token is invalid, try to refresh
+        await refreshStravaToken(stravaRefreshToken);
+        return [];
+      }
+  
       if (response.ok) return await response.json();
     } catch (error) {
       console.error('Error fetching Strava activities:', error);
@@ -589,7 +667,7 @@ const toggleSession = (sessionId) => {
   const nextSessionWeather = nextSession ? weatherData[nextSession.date] : null;
 
   return (
-    <div className="min-h-screen bg-gray-900 text-gray-200">
+    <div className="min-h-screen bg-gray-900 text-gray-200 font-sans">
       <div className="container mx-auto px-4 py-6 max-w-4xl">
         <div className="text-center mb-6">
           <h1 className="text-3xl font-bold text-white mb-3">Melbourne Marathon Training</h1>
@@ -621,10 +699,9 @@ const toggleSession = (sessionId) => {
             </div>
             <div className="text-center mt-3">
               {stravaConnected ? (
-                <span className={`text-xs transition-colors duration-500 ${
-                  stravaJustConnected ? 'text-green-400 font-bold' : 'text-orange-400'
-                }`}>
-                  {stravaJustConnected ? '🟢' : '🟠'} Strava Connected
+                <span className={'text-xs transition-colors duration-500 text-green-400 font-bold'
+                }>
+                    🟢 Strava Connected
                 </span>
               ) : (
                 <button onClick={connectStrava} className="text-orange-400 hover:text-orange-300 text-xs underline">Connect Strava</button>
@@ -661,8 +738,7 @@ const toggleSession = (sessionId) => {
             {trainingPlan.weeks.map((week) => (
               <button key={week.week} onClick={() => {
                 setCurrentWeek(week.week);
-                const today = new Date().toISOString().split('T')[0];
-                if (today >= week.start_date && today <= week.end_date) fetchWeatherForWeek(week);
+                fetchWeatherForWeek(week);
               }} className={`px-3 py-1.5 text-sm rounded-md font-medium ${currentWeek === week.week ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
                 W{week.week}
               </button>
@@ -684,7 +760,7 @@ const toggleSession = (sessionId) => {
                       const sessionId = `${week.week}-${session.date}`;
                       const isCompleted = completedSessions.has(sessionId);
                       const sessionType = getSessionType(session.title);
-                      const isPast = new Date(session.date) < new Date();
+                      const isPast = new Date(session.date) < new Date(new Date().toDateString());
                       const weather = weatherData[session.date];
 
                       return (
@@ -712,9 +788,7 @@ const toggleSession = (sessionId) => {
                                 {formatSessionDetails(session.details)}
                                 {isCompleted && (
                                  <div className="mt-2 pt-2 border-t border-gray-600/50">
-                                    {/* --- MODIFIED SECTION START --- */}
                                     
-                                    {/* First, show suggestions if they exist */}
                                     {suggestedActivities[sessionId] && (
                                       <div className="p-2 bg-orange-900/30 border border-orange-700/50 rounded text-xs">
                                         <div className="text-orange-200 mb-2">Link Strava activity: "{suggestedActivities[sessionId].activity.name}"?</div>
@@ -725,10 +799,8 @@ const toggleSession = (sessionId) => {
                                       </div>
                                     )}
 
-                                    {/* If no suggestions are active, check for a linked activity or show the manual add button */}
                                     {!suggestedActivities[sessionId] && (
                                       stravaActivities[sessionId] ? (
-                                        // If activity is linked, show the "View on Strava" link
                                         <div className="flex items-center gap-2">
                                           <a href={stravaActivities[sessionId]} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 text-orange-400 hover:text-orange-300 text-sm">
                                             <ExternalLink className="w-3 h-3" /> View on Strava
@@ -736,7 +808,6 @@ const toggleSession = (sessionId) => {
                                           <button onClick={() => removeStravaActivity(sessionId)} className="text-gray-500 hover:text-red-400"><X className="w-3 h-3" /></button>
                                         </div>
                                       ) :  (
-                                        // If not connected to Strava, show the manual "Add" button
                                         <button onClick={() => {
                                           const url = prompt('Enter Strava activity URL:');
                                           if (url && url.includes('strava.com')) addStravaActivity(sessionId, url);
@@ -746,7 +817,6 @@ const toggleSession = (sessionId) => {
                                         </button>
                                         
                                       ) 
-                                       // If connected but no link yet, show nothing
                                     )}
                                     
                                   </div>
@@ -782,3 +852,4 @@ const toggleSession = (sessionId) => {
 };
 
 export default MarathonTracker;
+
